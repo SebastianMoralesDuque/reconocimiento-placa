@@ -91,4 +91,4 @@ for contour in contours:
 recognized_text = "".join(recognized_chars)
 
 # Mostrar el resultado
-print("hola"+recognized_text)
+print(recognized_text)
