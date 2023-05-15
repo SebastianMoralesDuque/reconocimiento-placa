@@ -1,94 +1,65 @@
 import cv2
-import numpy as np
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+import pytesseract
+import mysql.connector
+import os
+from fuzzywuzzy import fuzz
+os.environ['TESSDATA_PREFIX'] = 'tesseract-ocr/tessdata'
 
-# definir el modelo
-model = keras.Sequential(
-    [
-        layers.InputLayer(input_shape=(28, 28, 1)),
-        layers.Conv2D(32, kernel_size=(3, 3), activation="relu"),
-        layers.MaxPooling2D(pool_size=(2, 2)),
-        layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
-        layers.MaxPooling2D(pool_size=(2, 2)),
-        layers.Flatten(),
-        layers.Dropout(0.5),
-        layers.Dense(10, activation="softmax"),
-    ]
+# Conectar a la base de datos de MariaDB
+mydb = mysql.connector.connect(
+    host="localhost",
+    user="root",
+    password="root",
+    database="placas"
 )
+mycursor = mydb.cursor()
 
-# cargar los datos de entrenamiento
-(x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
+# Cargar la imagen de la placa
+url='placas/qw.jpg'
+img = cv2.imread(url)
 
-# normalizar los datos
-x_train = x_train.astype("float32") / 255.0
-x_test = x_test.astype("float32") / 255.0
-
-# entrenar el modelo
-model.compile(loss="sparse_categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
-model.fit(x_train, y_train, batch_size=128, epochs=2, validation_split=0.1)
-
-# evaluar el modelo
-model.evaluate(x_test, y_test)
-
-# guardar el modelo
-model.save("modelo_entrenado.h5")
-
-# Cargar el modelo entrenado de TensorFlow
-model = tf.keras.models.load_model('modelo_entrenado.h5')
-
-# Leer la imagen
-img = cv2.imread('placa.jpg')
-
-# Convertir la imagen a escala de grises y aplicar un filtro gaussiano para reducir el ruido
+# Convertir la imagen a escala de grises
 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-# Aplicar la transformación de umbral adaptativo para convertir la imagen en blanco y negro
-thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+# Aplicar un filtro Gaussiano para suavizar la imagen
+gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-# Encontrar los contornos de la imagen
-contours, hierarchy = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+# Aplicar la binarización adaptativa para resaltar los bordes de la placa
+thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 21, 2)
 
-# Inicializar la lista de caracteres reconocidos
-recognized_chars = []
+# Encontrar los contornos de la placa
+contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-# Iterar sobre cada contorno
-for contour in contours:
-    # Obtener el rectángulo que rodea el contorno
-    (x, y, w, h) = cv2.boundingRect(contour)
 
-    # Ignorar los contornos que son muy pequeños o muy grandes
-    if w < 5 or h < 5 or w > 100 or h > 100:
-        continue
+def get_similarity(string1, string2):
+    similarity_ratio = fuzz.ratio(string1.lower(), string2.lower()) / 100
+    return similarity_ratio
 
-    # Recortar la región de interés (ROI) de la imagen
-    roi = thresh[y:y+h, x:x+w]
+# Seleccionar el contorno más grande (que debería ser la placa)
+if contours:
+    contour_sizes = [(cv2.contourArea(contour), contour) for contour in contours]
+    largest_contour = max(contour_sizes, key=lambda x: x[0])[1]
 
-    # Cambiar el tamaño de la ROI a 28x28 (el tamaño de entrada del modelo)
-    roi = cv2.resize(roi, (28, 28), interpolation=cv2.INTER_AREA)
+    # Dibujar un rectángulo alrededor de la placa
+    x, y, w, h = cv2.boundingRect(largest_contour)
+    cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
-    # Normalizar los valores de píxeles de la ROI a un rango de 0 a 1
-    roi = roi.astype("float32") / 255.0
+    # Recortar la imagen de la placa
+    plate_img = gray[y:y+h, x:x+w]
 
-    # Aplanar la ROI en un vector unidimensional
-    roi = np.reshape(roi, (1, 28, 28, 1))
+    # Obtener el texto de la placa utilizando Tesseract OCR
+    text = pytesseract.image_to_string(plate_img, lang='spa', config='--psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ -c tessedit_font_size=12 --oem 1').strip()
+    # Obtener el resultado correcto del usuario y calcular la precisión
+    resultado_correcto = input("Ingrese el resultado correcto:")
 
-    # Hacer una predicción con el modelo
-    pred = model.predict(roi)
+    precision = get_similarity(text,resultado_correcto);
 
-    # Obtener el índice del valor máximo de predicción (es decir, el dígito reconocido)
-    index = np.argmax(pred)
+    # Guardar los datos en la base de datos
+    sql = "INSERT INTO placas (imagen, texto_placa, resultado_correcto, prec) VALUES (%s, %s, %s, %s)"
+    val = (url, text, resultado_correcto.upper(), precision)
+    mycursor.execute(sql, val)
+    mydb.commit()
 
-    # Convertir el índice a un carácter ASCII (0-9)
-    char = chr(index + 48)
-
-    # Añadir el carácter reconocido a la lista de caracteres reconocidos
-    recognized_chars.append(char)
-
-# Unir los caracteres reconocidos en un string
-recognized_text = "".join(recognized_chars)
-
-# Mostrar el resultado
-print(recognized_text)
+    print(mycursor.rowcount, "registro insertado.")
+else:
+    print("No se encontró una placa en la imagen.")
